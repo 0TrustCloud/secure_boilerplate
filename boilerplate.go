@@ -78,7 +78,9 @@ func Start(ui *guikit.GUIKit, configPath string, provider IdentityProvider, rout
 	if err != nil { log.Fatalf("Mesh Node instantiation failed: %v", err) }
 
 	secure_bootstrap.BootstrapAuth(r, concreteProvider, meshNode, gatewayAddress)
-	identity_provider.RegisterRoutes(r, admin, audit, pe)
+	
+	// FIX: Pass the SessionManager from the concreteProvider
+	identity_provider.RegisterRoutes(r, admin, audit, pe, concreteProvider.SessionManager)
 
 	s := &Server{UI: ui, AuthProvider: provider, SearchEngine: searchEngine, DB: db, Router: r, Admin: admin, Audit: audit}
 
