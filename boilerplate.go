@@ -1,4 +1,4 @@
-package secure_boilerplate
+package boilerplate
 
 import (
 	"log"
@@ -15,7 +15,6 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// IdentityProvider is an empty interface, bypassing cross-package compiler restrictions.
 type IdentityProvider interface{}
 
 type Config struct {
@@ -33,9 +32,8 @@ type Server struct {
 	Audit        *identity_provider.AuditController
 }
 
-// Start enforces the strict boot sequence for the Zero-Trust Edge Node
-func Start(configPath string, provider IdentityProvider, routeRegister func(s *Server)) {
-	// 1. Load YAML Configuration
+// Start now accepts the UI instance directly to prevent nil pointer panics
+func Start(ui *guikit.GUIKit, configPath string, provider IdentityProvider, routeRegister func(s *Server)) {
 	var cfg Config
 	if cfgData, err := os.ReadFile(configPath); err == nil {
 		if err := yaml.Unmarshal(cfgData, &cfg); err != nil {
@@ -45,11 +43,6 @@ func Start(configPath string, provider IdentityProvider, routeRegister func(s *S
 		log.Printf("[WARNING] Bootstrap config not found at %s. Skipping YAML load.", configPath)
 	}
 
-	// 2. Core Infrastructure
-	ui, err := guikit.New("ui.db", "ui.wal")
-	if err != nil { log.Fatalf("Failed to boot guikit: %v", err) }
-
-	// Safe Runtime Type-Assertion
 	concreteProvider, ok := provider.(*webauthnext.Provider)
 	if !ok { log.Fatalf("FATAL: Provided IdentityProvider is not a *webauthnext.Provider") }
 
@@ -60,11 +53,9 @@ func Start(configPath string, provider IdentityProvider, routeRegister func(s *S
 	db := edgeNode.DB
 	r := edgeNode.Router
 
-	// 3. Mandatory Router Dependencies
 	r.GUIKit = ui
 	r.Mux.Handle("/index", ui.Mux)
 
-	// 4. Initialize Identity & Security Stack
 	bus := make(chan secure_network.SystemEvent, 10)
 	r.LocalBus = bus 
 
@@ -75,11 +66,9 @@ func Start(configPath string, provider IdentityProvider, routeRegister func(s *S
 
 	go scim.Start()
 
-	// 5. Execute Bootstrap Configuration
 	for _, app := range cfg.Apps { _ = admin.RegisterApp(app) }
 	for _, user := range cfg.Users { _ = admin.AssignUserToApp(user, user.SessionID) }
 
-	// 6. Identity & Hardware Handshake
 	keyTxn := db.BeginTxn()
 	gatewayPubKey, _ := db.Read(99, keyTxn, []byte("mesh_noise_pub"))
 	db.CommitTxn(keyTxn)
@@ -88,14 +77,9 @@ func Start(configPath string, provider IdentityProvider, routeRegister func(s *S
 	meshNode, err := secure_network.NewMeshNode(db, gatewayPubKey)
 	if err != nil { log.Fatalf("Mesh Node instantiation failed: %v", err) }
 
-	// 7. Strict Auth Flow
-	// FIX: Passing concreteProvider which has been properly type-asserted
 	secure_bootstrap.BootstrapAuth(r, concreteProvider, meshNode, gatewayAddress)
-
-	// 8. Register Pure Identity Routes
 	identity_provider.RegisterRoutes(r, admin, audit, pe)
 
-	// 9. Server Definition & Protected Default Route
 	s := &Server{UI: ui, AuthProvider: provider, SearchEngine: searchEngine, DB: db, Router: r, Admin: admin, Audit: audit}
 
 	if r.GUIKit != nil {
@@ -106,10 +90,8 @@ func Start(configPath string, provider IdentityProvider, routeRegister func(s *S
 		}))
 	}
 
-	// 10. Execute Application-Specific Logic
 	routeRegister(s)
 
-	// 11. Final Execution
 	log.Println("Booting Zero-Trust Identity Hub on :443")
 	if err := edgeNode.Start("443", r.TLSConfig); err != nil {
 		log.Fatalf("Edge Node crashed: %v", err)
