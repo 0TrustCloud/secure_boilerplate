@@ -2,6 +2,7 @@ package secure_boilerplate
 
 import (
 	"log"
+	"net/http"
 	"os"
 
 	"github.com/gddisney/guikit"
@@ -32,8 +33,75 @@ type Server struct {
 	Audit        *identity_provider.AuditController
 }
 
-// Start now accepts the UI instance directly to prevent nil pointer panics
-func Start(ui *guikit.GUIKit, configPath string, provider IdentityProvider, routeRegister func(s *Server)) {
+// --- NEW: Cryptographic UI Middleware to replace secure_bootstrap ---
+
+func RequireAuth(sm *secure_policy.SessionManager, next func(*guikit.Context)) func(*guikit.Context) {
+	return func(c *guikit.Context) {
+		cookie, err := c.R.Cookie("session_id")
+		if err != nil || cookie.Value == "" {
+			http.Redirect(c.W, c.R, "/login", http.StatusFound)
+			return
+		}
+
+		subjectID, err := sm.ValidateCookieToken(cookie.Value)
+		if err != nil {
+			http.SetCookie(c.W, &http.Cookie{Name: "session_id", Value: "", Path: "/", MaxAge: -1})
+			http.Redirect(c.W, c.R, "/login", http.StatusFound)
+			return
+		}
+		
+		c.Data["SubjectID"] = subjectID
+		next(c)
+	}
+}
+
+func RequirePolicy(pe *secure_policy.PolicyEngine, sm *secure_policy.SessionManager, action, resource string, next func(*guikit.Context)) func(*guikit.Context) {
+	return func(c *guikit.Context) {
+		cookie, err := c.R.Cookie("session_id")
+		if err != nil {
+			http.Redirect(c.W, c.R, "/login", http.StatusFound)
+			return
+		}
+
+		subjectID, err := sm.ValidateCookieToken(cookie.Value)
+		if err != nil {
+			http.Redirect(c.W, c.R, "/login", http.StatusFound)
+			return
+		}
+
+		if !pe.Evaluate([]byte(subjectID), action, resource, map[string]string{}) {
+			c.W.WriteHeader(http.StatusForbidden)
+			c.W.Write([]byte("Forbidden by Zero-Trust Policy"))
+			return
+		}
+
+		c.Data["SubjectID"] = subjectID
+		next(c)
+	}
+}
+
+func HandleLogout(sm *secure_policy.SessionManager) func(*guikit.Context) {
+	return func(c *guikit.Context) {
+		cookie, err := c.R.Cookie("session_id")
+		if err == nil && cookie.Value != "" {
+			sm.RevokeTokenString(cookie.Value)
+		}
+		http.SetCookie(c.W, &http.Cookie{
+			Name:     "session_id",
+			Value:    "",
+			Path:     "/",
+			MaxAge:   -1,
+			HttpOnly: true,
+			Secure:   true,
+			SameSite: http.SameSiteStrictMode,
+		})
+		http.Redirect(c.W, c.R, "/login", http.StatusFound)
+	}
+}
+
+// ------------------------------------------------------------------
+
+func Start(ui *guikit.GUIKit, configPath string, provider IdentityProvider, routeRegister func(s *Server), gateway string) {
 	var cfg Config
 	if cfgData, err := os.ReadFile(configPath); err == nil {
 		if err := yaml.Unmarshal(cfgData, &cfg); err != nil {
@@ -57,7 +125,7 @@ func Start(ui *guikit.GUIKit, configPath string, provider IdentityProvider, rout
 	r.Mux.Handle("/index", ui.Mux)
 
 	bus := make(chan secure_network.SystemEvent, 10)
-	r.LocalBus = bus 
+	r.LocalBus = bus
 
 	pe := secure_policy.NewPolicyEngine(db)
 	admin := &identity_provider.AdminController{DB: db, PolicyEngine: pe, LocalBus: bus}
@@ -72,21 +140,20 @@ func Start(ui *guikit.GUIKit, configPath string, provider IdentityProvider, rout
 	keyTxn := db.BeginTxn()
 	gatewayPubKey, _ := db.Read(99, keyTxn, []byte("mesh_noise_pub"))
 	db.CommitTxn(keyTxn)
-	gatewayAddress := "localhost:443"
+	gatewayAddress := gateway
 
 	meshNode, err := secure_network.NewMeshNode(db, gatewayPubKey)
 	if err != nil { log.Fatalf("Mesh Node instantiation failed: %v", err) }
 
 	secure_bootstrap.BootstrapAuth(r, concreteProvider, meshNode, gatewayAddress)
-	
-	// FIX: Pass the SessionManager from the concreteProvider
 	identity_provider.RegisterRoutes(r, admin, audit, pe, concreteProvider.SessionManager)
 
 	s := &Server{UI: ui, AuthProvider: provider, SearchEngine: searchEngine, DB: db, Router: r, Admin: admin, Audit: audit}
 
+	// SWAPPED out secure_bootstrap for our new local middleware wrappers
 	if r.GUIKit != nil {
-		r.GUIKit.Get("/logout", secure_bootstrap.HandleLogout)
-		r.GUIKit.Get("/", secure_bootstrap.RequireAuth(r, func(c *guikit.Context) {
+		r.GUIKit.Get("/logout", HandleLogout(concreteProvider.SessionManager))
+		r.GUIKit.Get("/", RequireAuth(concreteProvider.SessionManager, func(c *guikit.Context) {
 			c.Data["Title"] = "Identity Dashboard"
 			r.GUIKit.Render(c, "views/portal")
 		}))
