@@ -33,9 +33,9 @@ type Server struct {
 	Audit        *identity_provider.AuditController
 }
 
-// --- NEW: Cryptographic UI Middleware to replace secure_bootstrap ---
+// --- Cryptographic UI Middleware to replace legacy secure_bootstrap ---
 
-func RequireAuth(sm *secure_policy.SessionManager, next func(*guikit.Context)) func(*guikit.Context) {
+func RequireJWT(sm *secure_policy.SessionManager, next func(*guikit.Context)) func(*guikit.Context) {
 	return func(c *guikit.Context) {
 		cookie, err := c.R.Cookie("session_id")
 		if err != nil || cookie.Value == "" {
@@ -65,6 +65,7 @@ func RequirePolicy(pe *secure_policy.PolicyEngine, sm *secure_policy.SessionMana
 
 		subjectID, err := sm.ValidateCookieToken(cookie.Value)
 		if err != nil {
+			http.SetCookie(c.W, &http.Cookie{Name: "session_id", Value: "", Path: "/", MaxAge: -1})
 			http.Redirect(c.W, c.R, "/login", http.StatusFound)
 			return
 		}
@@ -150,10 +151,11 @@ func Start(ui *guikit.GUIKit, configPath string, provider IdentityProvider, rout
 
 	s := &Server{UI: ui, AuthProvider: provider, SearchEngine: searchEngine, DB: db, Router: r, Admin: admin, Audit: audit}
 
-	// SWAPPED out secure_bootstrap for our new local middleware wrappers
 	if r.GUIKit != nil {
 		r.GUIKit.Get("/logout", HandleLogout(concreteProvider.SessionManager))
-		r.GUIKit.Get("/", RequireAuth(concreteProvider.SessionManager, func(c *guikit.Context) {
+		
+		// SWAPPED secure_bootstrap for RequireJWT
+		r.GUIKit.Get("/", RequireJWT(concreteProvider.SessionManager, func(c *guikit.Context) {
 			c.Data["Title"] = "Identity Dashboard"
 			r.GUIKit.Render(c, "views/portal")
 		}))
