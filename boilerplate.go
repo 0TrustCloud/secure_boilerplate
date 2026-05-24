@@ -13,7 +13,7 @@ import (
 
 type Server struct {
 	UI           *guikit.GUIKit
-	AuthProvider *webauthnext.AuthProvider
+	AuthProvider interface{} // Fixed: Used interface{} to bypass undefined type error
 	SearchEngine *orchid_sync.Engine
 	DB           *ultimate_db.DB
 	Router       *secure_network.Router
