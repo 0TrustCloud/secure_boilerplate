@@ -1,8 +1,6 @@
-package secure_bootstrap
+package secure_boilerplate
 
 import (
-	"crypto/rand"
-	"crypto/rsa"
 	"log"
 	"net/http"
 	"os"
@@ -10,6 +8,7 @@ import (
 	"github.com/gddisney/guikit"
 	"github.com/gddisney/identity_provider"
 	"github.com/gddisney/orchid_sync"
+	"github.com/gddisney/secure_bootstrap"
 	"github.com/gddisney/secure_network"
 	"github.com/gddisney/secure_policy"
 	"github.com/gddisney/ultimate_db"
@@ -33,25 +32,59 @@ type Server struct {
 	Admin        *identity_provider.AdminController
 	Audit        *identity_provider.AuditController
 }
+// Public registers endpoints that explicitly bypass Zero-Trust authentication
+func (rm *RouteModule) Public(pattern string, handler http.HandlerFunc) {
+	rm.Server.Router.Mux.HandleFunc(pattern, handler)
+}
 
-var legacySessionManager *secure_policy.SessionManager
+// Secure registers an endpoint that enforces Zero-Trust authentication and Session State
+func (rm *RouteModule) Secure(pattern string, handler http.HandlerFunc) {
+	// 1. Wrap the standard http.HandlerFunc so it can be protected by RequireAuth
+	protectedHandler := secure_bootstrap.RequireAuth(rm.Server.Router, func(c *guikit.Context) {
+		handler(c.W, c.R)
+	})
 
-func Start(configPath string, provider IdentityProvider, routeRegister func(s *Server)) {
-	cfgData, err := os.ReadFile(configPath)
-	if err != nil {
-		log.Fatalf("Failed to read config: %v", err)
-	}
+	// 2. Apply UI secure headers, construct the context, and register to the multiplexer
+	rm.Server.Router.Mux.HandleFunc(pattern, rm.Server.UI.SecureHeaders(func(w http.ResponseWriter, r *http.Request) {
+		c := &guikit.Context{
+			W:        w,
+			R:        r,
+			Data:     make(map[string]interface{}),
+			CspNonce: rm.Server.UI.GetNonce(r),
+		}
+		protectedHandler(c)
+	}))
+}
+// --- Route Registration Module ---
+
+type RouteModule struct {
+	Server *Server
+}
+
+// Public registers endpoints that explicitly bypass Zero-Trust authentication
+func (rm *RouteModule) Public(pattern string, handler http.HandlerFunc) {
+	rm.Server.Router.Mux.HandleFunc(pattern, handler)
+}
+
+// ---------------------------------
+
+// Start now accepts the RouteModule callback to cleanly separate endpoint registration
+func Start(ui *guikit.GUIKit, configPath string, provider IdentityProvider, routeRegister func(routes *RouteModule)) {
 	var cfg Config
-	if err := yaml.Unmarshal(cfgData, &cfg); err != nil {
-		log.Fatalf("Failed to parse config: %v", err)
+	if cfgData, err := os.ReadFile(configPath); err == nil {
+		if err := yaml.Unmarshal(cfgData, &cfg); err != nil {
+			log.Fatalf("Failed to parse config: %v", err)
+		}
+	} else {
+		log.Printf("[WARNING] Bootstrap config not found at %s. Skipping YAML load.", configPath)
 	}
 
-	ui, err := guikit.New("ui.db", "ui.wal")
-	if err != nil {
-		log.Fatalf("Failed to boot guikit: %v", err)
+	concreteProvider, ok := provider.(*webauthnext.Provider)
+	if !ok {
+		log.Fatalf("FATAL: Provided IdentityProvider is not a *webauthnext.Provider")
 	}
 
-	searchEngine, err := orchid_sync.NewEngine("data.db", 443, provider.(*webauthnext.Provider))
+	searchEngine, err := orchid_sync.NewEngine("iam_data.db", 443, concreteProvider)
 	if err != nil {
 		log.Fatalf("Failed to boot search engine: %v", err)
 	}
@@ -64,35 +97,17 @@ func Start(configPath string, provider IdentityProvider, routeRegister func(s *S
 	r.Mux.Handle("/index", ui.Mux)
 
 	bus := make(chan secure_network.SystemEvent, 10)
+	r.LocalBus = bus 
+
 	pe := secure_policy.NewPolicyEngine(db)
-
-	jwtSigningKey, err := rsa.GenerateKey(rand.Reader, 2048)
-	if err != nil {
-		log.Fatalf("Failed to generate JWT signing key: %v", err)
-	}
-	legacySessionManager = secure_policy.NewSessionManager(db, jwtSigningKey)
-
-	admin := &identity_provider.AdminController{
-		DB:           db,
-		PolicyEngine: pe,
-		LocalBus:     bus,
-	}
-
+	admin := &identity_provider.AdminController{DB: db, PolicyEngine: pe, LocalBus: bus}
 	audit := identity_provider.NewAuditController(db, searchEngine, ui)
 	scim := identity_provider.NewSCIMDaemon(db, bus)
 
 	go scim.Start()
 
-	for _, app := range cfg.Apps {
-		if err := admin.RegisterApp(app); err != nil {
-			log.Printf("Bootstrap error: failed to register app %s: %v", app.ID, err)
-		}
-	}
-	for _, user := range cfg.Users {
-		if err := admin.AssignUserToApp(user, user.SessionID); err != nil {
-			log.Printf("Bootstrap error: failed to assign user %s: %v", user.Subject, err)
-		}
-	}
+	for _, app := range cfg.Apps { _ = admin.RegisterApp(app) }
+	for _, user := range cfg.Users { _ = admin.AssignUserToApp(user, user.SessionID) }
 
 	keyTxn := db.BeginTxn()
 	gatewayPubKey, _ := db.Read(99, keyTxn, []byte("mesh_noise_pub"))
@@ -104,60 +119,27 @@ func Start(configPath string, provider IdentityProvider, routeRegister func(s *S
 		log.Fatalf("Mesh Node instantiation failed: %v", err)
 	}
 
-	BootstrapAuth(r, provider, meshNode, gatewayAddress)
-	identity_provider.RegisterRoutes(r, admin, audit, pe, legacySessionManager)
+	secure_bootstrap.BootstrapAuth(r, concreteProvider, meshNode, gatewayAddress)
+	
+	// FIX: Pass the SessionManager from the concreteProvider
+	identity_provider.RegisterRoutes(r, admin, audit, pe, concreteProvider.SessionManager)
 
-	s := &Server{
-		UI:           ui,
-		AuthProvider: provider,
-		SearchEngine: searchEngine,
-		DB:           db,
-		Router:       r,
-		Admin:        admin,
-		Audit:        audit,
+	s := &Server{UI: ui, AuthProvider: provider, SearchEngine: searchEngine, DB: db, Router: r, Admin: admin, Audit: audit}
+
+	if r.GUIKit != nil {
+		r.GUIKit.Get("/logout", secure_bootstrap.HandleLogout)
+		r.GUIKit.Get("/", secure_bootstrap.RequireAuth(r, func(c *guikit.Context) {
+			c.Data["Title"] = "Identity Dashboard"
+			r.GUIKit.Render(c, "views/portal")
+		}))
 	}
-	routeRegister(s)
 
-	log.Println("Booting Zero-Trust Edge Node on :443")
+	// Initialize the module and execute the user's route registration
+	routeModule := &RouteModule{Server: s}
+	routeRegister(routeModule)
+
+	log.Println("Booting Zero-Trust Identity Hub on :443")
 	if err := edgeNode.Start("443", r.TLSConfig); err != nil {
 		log.Fatalf("Edge Node crashed: %v", err)
 	}
-}
-
-func BootstrapAuth(router *secure_network.Router, provider IdentityProvider, node *secure_network.MeshNode, address string) {}
-
-// Authentic standard HTTP middleware for routes
-func RequireAuth(next http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if sub := r.Header.Get("X-Secure-Subject"); sub != "" {
-			next.ServeHTTP(w, r)
-			return
-		}
-		if legacySessionManager == nil {
-			http.Redirect(w, r, "/bootstrap", http.StatusFound)
-			return
-		}
-		cookie, err := r.Cookie("secure_mesh_session")
-		if err != nil {
-			http.Redirect(w, r, "/bootstrap", http.StatusFound)
-			return
-		}
-		_, err = legacySessionManager.ValidateCookieToken(cookie.Value)
-		if err != nil {
-			http.Redirect(w, r, "/bootstrap", http.StatusFound)
-			return
-		}
-		next.ServeHTTP(w, r)
-	}
-}
-
-func HandleLogout(w http.ResponseWriter, r *http.Request) {
-	http.SetCookie(w, &http.Cookie{
-		Name:     "secure_mesh_session",
-		Value:    "",
-		Path:     "/",
-		MaxAge:   -1,
-		HttpOnly: true,
-	})
-	http.Redirect(w, r, "/bootstrap", http.StatusFound)
 }
