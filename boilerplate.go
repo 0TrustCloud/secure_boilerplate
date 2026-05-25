@@ -44,15 +44,15 @@ func (rm *RouteModule) Public(pattern string, handler http.HandlerFunc) {
 
 // Secure registers an endpoint that enforces Zero-Trust authentication
 func (rm *RouteModule) Secure(pattern string, handler http.HandlerFunc) {
-	// Adapter bridge to link secure_bootstrap.RequireAuth to the Guikit flow
+	// Adapter: Wrap standard handler into guikit-compatible func
 	protected := func(c *guikit.Context) {
-		secure_bootstrap.RequireAuth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			handler(w, r)
-		}))(c.W, c.R)
+		handler(c.W, c.R)
 	}
 
 	rm.Server.Router.Mux.HandleFunc(pattern, rm.Server.UI.SecureHeaders(func(w http.ResponseWriter, r *http.Request) {
-		protected(&guikit.Context{W: w, R: r, Data: make(map[string]interface{})})
+		c := &guikit.Context{W: w, R: r, Data: make(map[string]interface{})}
+		// Correct signature: Pass router then the handler function, then execute with context
+		secure_bootstrap.RequireAuth(rm.Server.Router, protected)(c)
 	}))
 }
 
@@ -62,15 +62,8 @@ func Start(ui *guikit.GUIKit, configPath string, provider IdentityProvider, rout
 		_ = yaml.Unmarshal(cfgData, &cfg)
 	}
 
-	concreteProvider, ok := provider.(*webauthnext.Provider)
-	if !ok {
-		log.Fatalf("FATAL: Provided IdentityProvider is not a *webauthnext.Provider")
-	}
-
-	searchEngine, err := orchid_sync.NewEngine("iam_data.db", 443, concreteProvider)
-	if err != nil {
-		log.Fatalf("Failed to boot search engine: %v", err)
-	}
+	concreteProvider := provider.(*webauthnext.Provider)
+	searchEngine, _ := orchid_sync.NewEngine("iam_data.db", 443, concreteProvider)
 
 	edgeNode := searchEngine.NetNode()
 	db := edgeNode.DB
@@ -96,33 +89,31 @@ func Start(ui *guikit.GUIKit, configPath string, provider IdentityProvider, rout
 	gatewayPubKey, _ := db.Read(99, keyTxn, []byte("mesh_noise_pub"))
 	db.CommitTxn(keyTxn)
 
-	meshNode, err := secure_network.NewMeshNode(db, gatewayPubKey)
-	if err != nil {
-		log.Fatalf("Mesh Node instantiation failed: %v", err)
-	}
+	meshNode, _ := secure_network.NewMeshNode(db, gatewayPubKey)
 
 	secure_bootstrap.BootstrapAuth(r, concreteProvider, meshNode, "localhost:443")
 	identity_provider.RegisterRoutes(r, admin, audit, pe, concreteProvider.SessionManager)
 
 	s := &Server{UI: ui, AuthProvider: provider, SearchEngine: searchEngine, DB: db, Router: r, Admin: admin, Audit: audit}
 
-	// Route registration using Adapters for the legacy handlers
+	// Register UI routes with proper context adapters
 	if r.GUIKit != nil {
-		r.GUIKit.Get("/logout", func(c *guikit.Context) {
-			secure_bootstrap.HandleLogout(c.W, c.R)
+		r.GUIKit.Mux.HandleFunc("GET /logout", func(w http.ResponseWriter, r *http.Request) {
+			secure_bootstrap.HandleLogout(w, r)
 		})
-		r.GUIKit.Get("/", func(c *guikit.Context) {
-			secure_bootstrap.RequireAuth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		
+		// Use RequireAuth directly in a way that respects the context
+		r.GUIKit.Mux.HandleFunc("GET /", func(w http.ResponseWriter, r *http.Request) {
+			c := &guikit.Context{W: w, R: r, Data: make(map[string]interface{})}
+			secure_bootstrap.RequireAuth(r.Router, func(c *guikit.Context) {
 				c.Data["Title"] = "Identity Dashboard"
 				r.GUIKit.Render(c, "views/portal")
-			}))(c.W, c.R)
+			})(c)
 		})
 	}
 
 	routeRegister(&RouteModule{Server: s})
 
 	log.Println("Booting Zero-Trust Identity Hub on :443")
-	if err := edgeNode.Start("443", r.TLSConfig); err != nil {
-		log.Fatalf("Edge Node crashed: %v", err)
-	}
+	_ = edgeNode.Start("443", r.TLSConfig)
 }
