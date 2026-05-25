@@ -37,21 +37,16 @@ type RouteModule struct {
 	Server *Server
 }
 
-// Public registers endpoints that explicitly bypass Zero-Trust authentication
 func (rm *RouteModule) Public(pattern string, handler http.HandlerFunc) {
 	rm.Server.Router.Mux.HandleFunc(pattern, handler)
 }
 
-// Secure registers an endpoint that enforces Zero-Trust authentication
 func (rm *RouteModule) Secure(pattern string, handler http.HandlerFunc) {
-	// Adapter: Wrap standard handler into guikit-compatible func
 	protected := func(c *guikit.Context) {
 		handler(c.W, c.R)
 	}
-
-	rm.Server.Router.Mux.HandleFunc(pattern, rm.Server.UI.SecureHeaders(func(w http.ResponseWriter, r *http.Request) {
-		c := &guikit.Context{W: w, R: r, Data: make(map[string]interface{})}
-		// Correct signature: Pass router then the handler function, then execute with context
+	rm.Server.Router.Mux.HandleFunc(pattern, rm.Server.UI.SecureHeaders(func(w http.ResponseWriter, req *http.Request) {
+		c := &guikit.Context{W: w, R: req, Data: make(map[string]interface{})}
 		secure_bootstrap.RequireAuth(rm.Server.Router, protected)(c)
 	}))
 }
@@ -64,50 +59,43 @@ func Start(ui *guikit.GUIKit, configPath string, provider IdentityProvider, rout
 
 	concreteProvider := provider.(*webauthnext.Provider)
 	searchEngine, _ := orchid_sync.NewEngine("iam_data.db", 443, concreteProvider)
-
 	edgeNode := searchEngine.NetNode()
-	db := edgeNode.DB
 	r := edgeNode.Router
-
 	r.GUIKit = ui
 	r.Mux.Handle("/index", ui.Mux)
 
 	bus := make(chan secure_network.SystemEvent, 10)
 	r.LocalBus = bus
-
-	pe := secure_policy.NewPolicyEngine(db)
-	admin := &identity_provider.AdminController{DB: db, PolicyEngine: pe, LocalBus: bus}
-	audit := identity_provider.NewAuditController(db, searchEngine, ui)
-	scim := identity_provider.NewSCIMDaemon(db, bus)
-
+	pe := secure_policy.NewPolicyEngine(edgeNode.DB)
+	admin := &identity_provider.AdminController{DB: edgeNode.DB, PolicyEngine: pe, LocalBus: bus}
+	audit := identity_provider.NewAuditController(edgeNode.DB, searchEngine, ui)
+	scim := identity_provider.NewSCIMDaemon(edgeNode.DB, bus)
 	go scim.Start()
 
 	for _, app := range cfg.Apps { _ = admin.RegisterApp(app) }
 	for _, user := range cfg.Users { _ = admin.AssignUserToApp(user, user.SessionID) }
 
-	keyTxn := db.BeginTxn()
-	gatewayPubKey, _ := db.Read(99, keyTxn, []byte("mesh_noise_pub"))
-	db.CommitTxn(keyTxn)
+	keyTxn := edgeNode.DB.BeginTxn()
+	gatewayPubKey, _ := edgeNode.DB.Read(99, keyTxn, []byte("mesh_noise_pub"))
+	edgeNode.DB.CommitTxn(keyTxn)
 
-	meshNode, _ := secure_network.NewMeshNode(db, gatewayPubKey)
-
+	meshNode, _ := secure_network.NewMeshNode(edgeNode.DB, gatewayPubKey)
 	secure_bootstrap.BootstrapAuth(r, concreteProvider, meshNode, "localhost:443")
 	identity_provider.RegisterRoutes(r, admin, audit, pe, concreteProvider.SessionManager)
 
-	s := &Server{UI: ui, AuthProvider: provider, SearchEngine: searchEngine, DB: db, Router: r, Admin: admin, Audit: audit}
+	s := &Server{UI: ui, AuthProvider: provider, SearchEngine: searchEngine, DB: edgeNode.DB, Router: r, Admin: admin, Audit: audit}
 
-	// Register UI routes with proper context adapters
-	if r.GUIKit != nil {
-		r.GUIKit.Mux.HandleFunc("GET /logout", func(w http.ResponseWriter, r *http.Request) {
-			secure_bootstrap.HandleLogout(w, r)
+	// Register UI routes correctly using scope-captured 'r' (router) and 'ui'
+	if ui != nil {
+		ui.Mux.HandleFunc("GET /logout", func(w http.ResponseWriter, req *http.Request) {
+			secure_bootstrap.HandleLogout(w, req)
 		})
 		
-		// Use RequireAuth directly in a way that respects the context
-		r.GUIKit.Mux.HandleFunc("GET /", func(w http.ResponseWriter, r *http.Request) {
-			c := &guikit.Context{W: w, R: r, Data: make(map[string]interface{})}
-			secure_bootstrap.RequireAuth(r.Router, func(c *guikit.Context) {
-				c.Data["Title"] = "Identity Dashboard"
-				r.GUIKit.Render(c, "views/portal")
+		ui.Mux.HandleFunc("GET /", func(w http.ResponseWriter, req *http.Request) {
+			c := &guikit.Context{W: w, R: req, Data: make(map[string]interface{})}
+			secure_bootstrap.RequireAuth(r, func(ctx *guikit.Context) {
+				ctx.Data["Title"] = "Identity Dashboard"
+				ui.Render(ctx, "views/portal")
 			})(c)
 		})
 	}
@@ -115,5 +103,7 @@ func Start(ui *guikit.GUIKit, configPath string, provider IdentityProvider, rout
 	routeRegister(&RouteModule{Server: s})
 
 	log.Println("Booting Zero-Trust Identity Hub on :443")
-	_ = edgeNode.Start("443", r.TLSConfig)
+	if err := edgeNode.Start("443", r.TLSConfig); err != nil {
+		log.Fatalf("Edge Node crashed: %v", err)
+	}
 }
