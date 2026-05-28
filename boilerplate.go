@@ -357,3 +357,28 @@ func Start(
 					},
 				)(c)
 			},
+		)
+	}
+
+	// --------------------------------------------------
+	// CUSTOM ROUTES
+	// --------------------------------------------------
+
+	routeRegister(
+		&RouteModule{
+			Server: s,
+		},
+	)
+
+	// --------------------------------------------------
+	// START SERVER
+	// --------------------------------------------------
+
+	log.Println(
+		"Booting Zero-Trust Identity Hub on :443",
+	)
+
+	if err := node.Start("443", r.TLSConfig); err != nil {
+		log.Fatalf("Edge Node crashed: %v", err)
+	}
+}
