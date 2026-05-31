@@ -128,7 +128,7 @@ func Start(
 
 	// FIX 1: Direct Mux synchronization. Link GUIKit patterns to match standard network router tables.
 	if ui != nil {
-		r.Mux.Handle("/index", ui.Mux)
+		r.Mux.Handle("/{$}", ui.Mux)
 	}
 
 	bus := make(chan secure_network.SystemEvent, 128)
