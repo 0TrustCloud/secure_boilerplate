@@ -1,6 +1,9 @@
 package secure_boilerplate
 
 import (
+	"context"
+	"crypto/rand"
+	"crypto/rsa"
 	"log"
 	"net/http"
 	"os"
@@ -10,6 +13,7 @@ import (
 	"github.com/0TrustCloud/logger"
 	"github.com/0TrustCloud/orchid_sync"
 	"github.com/0TrustCloud/secure_bootstrap"
+	"github.com/0TrustCloud/secure_data_format"
 	"github.com/0TrustCloud/secure_network"
 	"github.com/0TrustCloud/secure_policy"
 	"github.com/0TrustCloud/service_keys"
@@ -34,11 +38,20 @@ type Server struct {
 	Admin        *identity_provider.AdminController
 	Audit        *identity_provider.AuditController
 	Logger       *logger.LogDispatcher
-	MeshNode     *secure_network.MeshNode // FIX: Swapped back to MeshNode explicitly
+	MeshNode     *secure_network.MeshNode
 }
 
 type RouteModule struct {
 	Server *Server
+}
+
+type PlatformControl struct {
+	Router *secure_network.Router
+}
+
+func (pc *PlatformControl) Shutdown(ctx context.Context) error {
+	// Satisfies the graceful control plane shutdown lifecycle hooks
+	return nil
 }
 
 func (rm *RouteModule) Public(pattern string, handler http.HandlerFunc) {
@@ -70,7 +83,7 @@ func Start(
 	configPath string,
 	provider IdentityProvider,
 	routeRegister func(routes *RouteModule),
-) {
+) *PlatformControl {
 
 	// --------------------------------------------------
 	// CONFIG
@@ -87,10 +100,25 @@ func Start(
 	db := ui.DB 
 
 	// --------------------------------------------------
+	// SECURE DATA FORMAT (SDF) CORE ENGINE
+	// --------------------------------------------------
+	jwtSigningKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		log.Fatalf("Failed generating cryptographic signing key: %v", err)
+	}
+
+	var store ultimate_db.KVStore
+	var lockManager ultimate_db.LockManager
+
+	sdfEngine, err := secure_data_format.New(store, lockManager, "iam_edge_node", jwtSigningKey)
+	if err != nil {
+		log.Fatalf("Failed to initialize SDF engine context: %v", err)
+	}
+
+	// --------------------------------------------------
 	// LOGGER
 	// --------------------------------------------------
-	logPage := ultimate_db.PageID(200)
-	sysLogger, err := logger.NewLogDispatcher("iam_edge_node", db, logPage, 1000)
+	sysLogger, err := logger.NewLogDispatcher("iam_edge_node", 1000, sdfEngine)
 	if err != nil {
 		log.Fatalf("Failed to initialize logger: %v", err)
 	}
@@ -98,7 +126,7 @@ func Start(
 	// --------------------------------------------------
 	// POLICY ENGINE
 	// --------------------------------------------------
-	pe := secure_policy.NewPolicyEngine(db)
+	pe := secure_policy.NewPolicyEngine(sdfEngine)
 
 	// --------------------------------------------------
 	// ROUTER (Explicit Wire-up)
@@ -129,12 +157,9 @@ func Start(
 	gatewayPubKey, _ := db.Read(99, keyTxn, []byte("mesh_noise_pub"))
 	db.CommitTxn(keyTxn)
 
-	skm := service_keys.NewServiceKeyManager(db, nil, nil)
-	
 	meshNode, err := secure_network.NewMeshNode(
-		db,
+		sdfEngine,
 		gatewayPubKey,
-		skm,
 		sysLogger,
 	)
 	if err != nil {
@@ -156,17 +181,11 @@ func Start(
 	// --------------------------------------------------
 	// CONTROLLERS
 	// --------------------------------------------------
-	admin := &identity_provider.AdminController{
-		DB:           db,
-		PolicyEngine: pe,
-		LocalBus:     bus,
-		Logger:       sysLogger,
-	}
-
-	audit := identity_provider.NewAuditController(searchEngine, ui)
+	admin := identity_provider.NewAdminController(db, pe, bus, sysLogger, sdfEngine)
+	audit := identity_provider.NewAuditController(searchEngine, ui, sdfEngine)
 	sysLogger.RegisterExporter(audit)
 
-	scim := identity_provider.NewSCIMDaemon(db, bus, sysLogger)
+	scim := identity_provider.NewSCIMDaemon(db, bus, sysLogger, sdfEngine)
 	go scim.Start()
 
 	// --------------------------------------------------
@@ -241,7 +260,8 @@ func Start(
 	// --------------------------------------------------
 	log.Println("Booting Zero-Trust Identity Hub on :443")
 	
-	// FIX: We set the port directly on the Router and call its native Boot() method.
 	r.Port = "443"
-	r.Boot() 
+	go r.Boot() 
+
+	return &PlatformControl{Router: r}
 }
