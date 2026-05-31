@@ -39,7 +39,7 @@ type Server struct {
 	Audit        *identity_provider.AuditController
 	Logger       *logger.LogDispatcher
 	MeshNode     *secure_network.MeshNode
-	ServiceKeys  *service_keys.ServiceKeyManager // Integrated hardware key manager
+	ServiceKeys  *service_keys.ServiceKeyManager
 }
 
 type RouteModule struct {
@@ -51,7 +51,6 @@ type PlatformControl struct {
 }
 
 func (pc *PlatformControl) Shutdown(ctx context.Context) error {
-	// Satisfies the graceful control plane shutdown lifecycle hooks
 	return nil
 }
 
@@ -108,8 +107,9 @@ func Start(
 		log.Fatalf("Failed generating cryptographic signing key: %v", err)
 	}
 
-	var store ultimate_db.KVStore
-	var lockManager ultimate_db.LockManager
+	// Fixed: Instantiated active concrete store and locking drivers to clear the initialization constraints
+	store := ultimate_db.NewBTreeKVStore(db)
+	lockManager := ultimate_db.New2PLLockManager()
 
 	sdfEngine, err := secure_data_format.New(store, lockManager, "iam_edge_node", jwtSigningKey)
 	if err != nil {
@@ -125,7 +125,7 @@ func Start(
 	}
 
 	// --------------------------------------------------
-	// SERVICE KEYS MANAGER (TPM Identity & Hardware Attestation)
+	// SERVICE KEYS MANAGER
 	// --------------------------------------------------
 	skm := service_keys.NewServiceKeyManager(sdfEngine, concreteProvider, sysLogger)
 
@@ -135,12 +135,12 @@ func Start(
 	pe := secure_policy.NewPolicyEngine(sdfEngine)
 
 	// --------------------------------------------------
-	// ROUTER (Explicit Wire-up)
+	// ROUTER
 	// --------------------------------------------------
 	r, err := secure_network.NewRouter(
-		sdfEngine, // Fixed: Pass the *secure_data_format.SecureDataEngine context instead of raw DB pointer
+		sdfEngine,
 		ui,
-		"session_id", // Target Cookie
+		"session_id",
 		pe,
 		concreteProvider.SessionManager,
 		sysLogger,
@@ -157,7 +157,7 @@ func Start(
 	r.LocalBus = bus
 
 	// --------------------------------------------------
-	// MESH NODE (Explicit Wire-up)
+	// MESH NODE
 	// --------------------------------------------------
 	keyTxn := db.BeginTxn()
 	gatewayPubKey, _ := db.Read(99, keyTxn, []byte("mesh_noise_pub"))
@@ -212,7 +212,6 @@ func Start(
 	// --------------------------------------------------
 	// ROUTE REGISTRATION
 	// --------------------------------------------------
-	// Fixed: Added explicit 'db' parameter invocation to fulfill signature requirements
 	secure_bootstrap.BootstrapAuth(r, db, concreteProvider, meshNode, "localhost:443", sysLogger)
 
 	identity_provider.RegisterRoutes(
