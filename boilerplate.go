@@ -138,7 +138,7 @@ func Start(
 	// ROUTER (Explicit Wire-up)
 	// --------------------------------------------------
 	r, err := secure_network.NewRouter(
-		db,
+		sdfEngine, // Fixed: Pass the *secure_data_format.SecureDataEngine context instead of raw DB pointer
 		ui,
 		"session_id", // Target Cookie
 		pe,
@@ -212,7 +212,8 @@ func Start(
 	// --------------------------------------------------
 	// ROUTE REGISTRATION
 	// --------------------------------------------------
-	secure_bootstrap.BootstrapAuth(r, concreteProvider, meshNode, "localhost:443", sysLogger)
+	// Fixed: Added explicit 'db' parameter invocation to fulfill signature requirements
+	secure_bootstrap.BootstrapAuth(r, db, concreteProvider, meshNode, "localhost:443", sysLogger)
 
 	identity_provider.RegisterRoutes(
 		r,
