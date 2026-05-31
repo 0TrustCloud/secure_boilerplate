@@ -18,7 +18,7 @@ import (
 	"github.com/0TrustCloud/secure_policy"
 	"github.com/0TrustCloud/service_keys"
 	"github.com/0TrustCloud/ultimate_db"
-	"github.com/0TrustCloud/webauthnext"
+	webauthnext "github.com/0TrustCloud/auth_provider"
 	"gopkg.in/yaml.v3"
 )
 
