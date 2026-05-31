@@ -206,7 +206,7 @@ func Start(
 			secure_bootstrap.HandleLogout(w, req)
 		})
 
-		r.Mux.HandleFunc("GET /", func(w http.ResponseWriter, req *http.Request) {
+		r.Mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, req *http.Request) {
 			c := &guikit.Context{W: w, R: req, Data: make(map[string]interface{})}
 			secure_bootstrap.RequireAuth(r, func(ctx *guikit.Context) {
 				ctx.Data["Title"] = "Identity Dashboard"
