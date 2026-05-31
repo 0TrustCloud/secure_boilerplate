@@ -39,6 +39,7 @@ type Server struct {
 	Audit        *identity_provider.AuditController
 	Logger       *logger.LogDispatcher
 	MeshNode     *secure_network.MeshNode
+	ServiceKeys  *service_keys.ServiceKeyManager // Integrated hardware key manager
 }
 
 type RouteModule struct {
@@ -122,6 +123,11 @@ func Start(
 	if err != nil {
 		log.Fatalf("Failed to initialize logger: %v", err)
 	}
+
+	// --------------------------------------------------
+	// SERVICE KEYS MANAGER (TPM Identity & Hardware Attestation)
+	// --------------------------------------------------
+	skm := service_keys.NewServiceKeyManager(sdfEngine, concreteProvider, sysLogger)
 
 	// --------------------------------------------------
 	// POLICY ENGINE
@@ -231,6 +237,7 @@ func Start(
 		Audit:        audit,
 		Logger:       sysLogger,
 		MeshNode:     meshNode,
+		ServiceKeys:  skm,
 	}
 
 	// --------------------------------------------------
