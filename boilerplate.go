@@ -85,29 +85,19 @@ func Start(
 	routeRegister func(routes *RouteModule),
 ) *PlatformControl {
 
-	// --------------------------------------------------
-	// CONFIG
-	// --------------------------------------------------
 	var cfg Config
 	if cfgData, err := os.ReadFile(configPath); err == nil {
 		_ = yaml.Unmarshal(cfgData, &cfg)
 	}
 
-	// --------------------------------------------------
-	// PROVIDER & DB
-	// --------------------------------------------------
 	concreteProvider := provider.(*webauthnext.Provider)
 	db := ui.DB 
 
-	// --------------------------------------------------
-	// SECURE DATA FORMAT (SDF) CORE ENGINE
-	// --------------------------------------------------
 	jwtSigningKey, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
 		log.Fatalf("Failed generating cryptographic signing key: %v", err)
 	}
 
-	// Fixed: Instantiated active concrete store and locking drivers to clear the initialization constraints
 	store := ultimate_db.NewBTreeKVStore(db)
 	lockManager := ultimate_db.New2PLLockManager()
 
@@ -116,27 +106,14 @@ func Start(
 		log.Fatalf("Failed to initialize SDF engine context: %v", err)
 	}
 
-	// --------------------------------------------------
-	// LOGGER
-	// --------------------------------------------------
 	sysLogger, err := logger.NewLogDispatcher("iam_edge_node", 1000, sdfEngine)
 	if err != nil {
 		log.Fatalf("Failed to initialize logger: %v", err)
 	}
 
-	// --------------------------------------------------
-	// SERVICE KEYS MANAGER
-	// --------------------------------------------------
 	skm := service_keys.NewServiceKeyManager(sdfEngine, concreteProvider, sysLogger)
-
-	// --------------------------------------------------
-	// POLICY ENGINE
-	// --------------------------------------------------
 	pe := secure_policy.NewPolicyEngine(sdfEngine)
 
-	// --------------------------------------------------
-	// ROUTER
-	// --------------------------------------------------
 	r, err := secure_network.NewRouter(
 		sdfEngine,
 		ui,
@@ -149,6 +126,7 @@ func Start(
 		log.Fatalf("Failed to initialize Router: %v", err)
 	}
 
+	// FIX 1: Direct Mux synchronization. Link GUIKit patterns to match standard network router tables.
 	if ui != nil {
 		r.Mux.Handle("/index", ui.Mux)
 	}
@@ -156,9 +134,6 @@ func Start(
 	bus := make(chan secure_network.SystemEvent, 128)
 	r.LocalBus = bus
 
-	// --------------------------------------------------
-	// MESH NODE
-	// --------------------------------------------------
 	keyTxn := db.BeginTxn()
 	gatewayPubKey, _ := db.Read(99, keyTxn, []byte("mesh_noise_pub"))
 	db.CommitTxn(keyTxn)
@@ -172,9 +147,6 @@ func Start(
 		log.Fatalf("Failed creating mesh node: %v", err)
 	}
 
-	// --------------------------------------------------
-	// SEARCH ENGINE
-	// --------------------------------------------------
 	searchEngine, err := orchid_sync.NewEngine(
 		db,
 		meshNode,
@@ -184,9 +156,6 @@ func Start(
 		log.Fatalf("Failed to initialize OrchidSync: %v", err)
 	}
 
-	// --------------------------------------------------
-	// CONTROLLERS
-	// --------------------------------------------------
 	admin := identity_provider.NewAdminController(db, pe, bus, sysLogger, sdfEngine)
 	audit := identity_provider.NewAuditController(searchEngine, ui, sdfEngine)
 	sysLogger.RegisterExporter(audit)
@@ -194,9 +163,6 @@ func Start(
 	scim := identity_provider.NewSCIMDaemon(db, bus, sysLogger, sdfEngine)
 	go scim.Start()
 
-	// --------------------------------------------------
-	// BOOTSTRAP APPS & USERS
-	// --------------------------------------------------
 	for _, app := range cfg.Apps {
 		if err := admin.RegisterApp(app, "system_bootstrap"); err != nil {
 			sysLogger.Error("Failed registering app: " + err.Error())
@@ -209,9 +175,6 @@ func Start(
 		}
 	}
 
-	// --------------------------------------------------
-	// ROUTE REGISTRATION
-	// --------------------------------------------------
 	secure_bootstrap.BootstrapAuth(r, db, concreteProvider, meshNode, "localhost:443", sysLogger)
 
 	identity_provider.RegisterRoutes(
@@ -224,9 +187,6 @@ func Start(
 		configPath,
 	)
 
-	// --------------------------------------------------
-	// SERVER OBJECT
-	// --------------------------------------------------
 	s := &Server{
 		UI:           ui,
 		AuthProvider: provider,
@@ -240,15 +200,13 @@ func Start(
 		ServiceKeys:  skm,
 	}
 
-	// --------------------------------------------------
-	// DEFAULT ROUTES
-	// --------------------------------------------------
+	// FIX 2: Re-route default fallback pages through r.Router.Mux directly instead of breaking boundaries via ui.Mux
 	if ui != nil {
-		ui.Mux.HandleFunc("GET /logout", func(w http.ResponseWriter, req *http.Request) {
+		r.Mux.HandleFunc("GET /logout", func(w http.ResponseWriter, req *http.Request) {
 			secure_bootstrap.HandleLogout(w, req)
 		})
 
-		ui.Mux.HandleFunc("GET /", func(w http.ResponseWriter, req *http.Request) {
+		r.Mux.HandleFunc("GET /", func(w http.ResponseWriter, req *http.Request) {
 			c := &guikit.Context{W: w, R: req, Data: make(map[string]interface{})}
 			secure_bootstrap.RequireAuth(r, func(ctx *guikit.Context) {
 				ctx.Data["Title"] = "Identity Dashboard"
@@ -257,16 +215,10 @@ func Start(
 		})
 	}
 
-	// --------------------------------------------------
-	// CUSTOM ROUTES
-	// --------------------------------------------------
+	// Custom configurations mount perfectly on the single network multiplexer tracking layout
 	routeRegister(&RouteModule{Server: s})
 
-	// --------------------------------------------------
-	// START SERVER
-	// --------------------------------------------------
 	log.Println("Booting Zero-Trust Identity Hub on :443")
-	
 	r.Port = "443"
 	go r.Boot() 
 
