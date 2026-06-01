@@ -141,7 +141,6 @@ func Start(
 		}
 	}
 
-	concreteProvider := provider.(*webauthnext.Provider)
 	db := ui.DB 
 
 	jwtSigningKey, err := rsa.GenerateKey(rand.Reader, 2048)
@@ -162,23 +161,26 @@ func Start(
 		log.Fatalf("Failed to initialize SDF engine context: %v", err)
 	}
 
-	// 1. Properly initialize the SessionManager using the container signing primitives
 	sessionManager := secure_policy.NewSessionManager(sdfEngine, &jwtSigningKey.PublicKey)
 
-	// 2. Invoke the native constructor to cleanly hydrate the WebAuthn Provider state
+	// FIX: Construct the provider using the formal constructor factory pattern
 	realProvider, err := webauthnext.New(ui, sessionManager, sdfEngine, serviceName, cfg.Server.Host, cfg.Server.Domain)
 	if err != nil {
 		log.Fatalf("Failed to execute native provider constructor: %v", err)
 	}
-	// Hydrate the shell pointer passed from the application block
-	*concreteProvider = *realProvider
+
+	// Safely pass down the newly initialized provider values via pointer to the placeholder parameter
+	if inputPtr, ok := provider.(*webauthnext.Provider); ok && inputPtr != nil {
+		inputPtr.SessionManager = realProvider.SessionManager
+	}
 
 	sysLogger, err := logger.NewLogDispatcher(serviceName, 1000, sdfEngine)
 	if err != nil {
 		log.Fatalf("Failed to initialize logger: %v", err)
 	}
 
-	skm := service_keys.NewServiceKeyManager(sdfEngine, concreteProvider, sysLogger)
+	// FIX: Pass the guaranteed realProvider instance directly to avoid copying internal mutexes by value
+	skm := service_keys.NewServiceKeyManager(sdfEngine, realProvider, sysLogger)
 	pe := secure_policy.NewPolicyEngine(sdfEngine)
 
 	if cfg.Files.RbacPath != "" {
@@ -207,7 +209,6 @@ func Start(
 		}
 	}
 
-	// 3. Pass the guaranteed, concrete sessionManager instance directly into the router
 	r, err := secure_network.NewRouter(
 		sdfEngine,
 		ui,
@@ -260,13 +261,15 @@ func Start(
 	if cfg.Server.Host == "" {
 		hostAddr = "localhost:443"
 	}
-	secure_bootstrap.BootstrapAuth(r, db, concreteProvider, meshNode, hostAddr, sysLogger)
+	
+	// FIX: Use realProvider here to eliminate thread execution lockups
+	secure_bootstrap.BootstrapAuth(r, db, realProvider, meshNode, hostAddr, sysLogger)
 
 	identity_provider.RegisterRoutes(r, admin, audit, pe, sessionManager, sysLogger, configPath)
 
 	s := &Server{
 		UI:           ui,
-		AuthProvider: concreteProvider,
+		AuthProvider: realProvider, 
 		SearchEngine: searchEngine,
 		DB:           db,
 		Router:       r,
