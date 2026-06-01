@@ -24,7 +24,43 @@ import (
 
 type IdentityProvider interface{}
 
-type Config struct {
+// Declarative Schemas managed entirely inside the boilerplate core
+type ViewDefinition struct {
+	Name        string   `yaml:"name"`
+	Path        string   `yaml:"path"`
+	Template    string   `yaml:"template"`
+	Policy      string   `yaml:"policy"` // "public" or "secure"
+	DataSources []string `yaml:"data_sources"`
+}
+
+type RBACConfig struct {
+	Roles []struct {
+		Name        string   `yaml:"name"`
+		Permissions []string `yaml:"permissions"`
+	} `yaml:"roles"`
+}
+
+type ABACConfig struct {
+	Policies []struct {
+		Subject  string `yaml:"subject"`
+		Action   string `yaml:"action"`
+		Resource string `yaml:"resource"`
+		Effect   string `yaml:"effect"`
+	} `yaml:"policies"`
+}
+
+type MasterConfig struct {
+	Server struct {
+		ServiceName string `yaml:"service_name"`
+		Host        string `yaml:"host"`
+		Domain      string `yaml:"domain"`
+	} `yaml:"server"`
+	Files struct {
+		RbacPath  string `yaml:"rbac_path"`
+		AbacPath  string `yaml:"abac_path"`
+		ViewsPath string `yaml:"views_path"`
+	} `yaml:"files"`
+	Views []ViewDefinition                `yaml:"views"`
 	Apps  []identity_provider.Application `yaml:"apps"`
 	Users []identity_provider.Identity    `yaml:"users"`
 }
@@ -44,6 +80,7 @@ type Server struct {
 
 type RouteModule struct {
 	Server *Server
+	Views  []ViewDefinition
 }
 
 type PlatformControl struct {
@@ -85,9 +122,26 @@ func Start(
 	routeRegister func(routes *RouteModule),
 ) *PlatformControl {
 
-	var cfg Config
-	if cfgData, err := os.ReadFile(configPath); err == nil {
-		_ = yaml.Unmarshal(cfgData, &cfg)
+	// 1. Ingest Master Configuration Layout
+	var cfg MasterConfig
+	cfgData, err := os.ReadFile(configPath)
+	if err != nil {
+		log.Fatalf("Boilerplate Critical: Missing configuration footprint: %v", err)
+	}
+	if err := yaml.Unmarshal(cfgData, &cfg); err != nil {
+		log.Fatalf("Boilerplate Critical: Malformed configuration parameters: %v", err)
+	}
+
+	// Dynamic fallback view loader if pathing is decoupled from main file
+	if cfg.Files.ViewsPath != "" && len(cfg.Views) == 0 {
+		if vData, err := os.ReadFile(cfg.Files.ViewsPath); err == nil {
+			var secondaryViews struct {
+				Views []ViewDefinition `yaml:"views"`
+			}
+			if yaml.Unmarshal(vData, &secondaryViews) == nil {
+				cfg.Views = secondaryViews.Views
+			}
+		}
 	}
 
 	concreteProvider := provider.(*webauthnext.Provider)
@@ -101,18 +155,55 @@ func Start(
 	store := ultimate_db.NewBTreeKVStore(db)
 	lockManager := ultimate_db.New2PLLockManager()
 
-	sdfEngine, err := secure_data_format.New(store, lockManager, "iam_edge_node", jwtSigningKey)
+	serviceName := cfg.Server.ServiceName
+	if serviceName == "" {
+		serviceName = "iam_edge_node"
+	}
+
+	sdfEngine, err := secure_data_format.New(store, lockManager, serviceName, jwtSigningKey)
 	if err != nil {
 		log.Fatalf("Failed to initialize SDF engine context: %v", err)
 	}
 
-	sysLogger, err := logger.NewLogDispatcher("iam_edge_node", 1000, sdfEngine)
+	if concreteProvider.SessionManager == nil {
+		concreteProvider.SessionManager = secure_policy.NewSessionManager(sdfEngine, &jwtSigningKey.PublicKey)
+	}
+
+	sysLogger, err := logger.NewLogDispatcher(serviceName, 1000, sdfEngine)
 	if err != nil {
 		log.Fatalf("Failed to initialize logger: %v", err)
 	}
 
 	skm := service_keys.NewServiceKeyManager(sdfEngine, concreteProvider, sysLogger)
 	pe := secure_policy.NewPolicyEngine(sdfEngine)
+
+	// 2. Automatically Hydrate RBAC Rules directly within Container Scope
+	if cfg.Files.RbacPath != "" {
+		if rbacData, err := os.ReadFile(cfg.Files.RbacPath); err == nil {
+			var rbacCfg RBACConfig
+			if yaml.Unmarshal(rbacData, &rbacCfg) == nil {
+				for _, role := range rbacCfg.Roles {
+					for _, perm := range role.Permissions {
+						_ = pe.GrantPermission([]byte(role.Name), perm)
+					}
+				}
+				log.Printf("[Container Bootstrap] Loaded structural RBAC controls from %s", cfg.Files.RbacPath)
+			}
+		}
+	}
+
+	// 3. Automatically Hydrate ABAC Policies directly within Container Scope
+	if cfg.Files.AbacPath != "" {
+		if abacData, err := os.ReadFile(cfg.Files.AbacPath); err == nil {
+			var abacCfg ABACConfig
+			if yaml.Unmarshal(abacData, &abacCfg) == nil {
+				for _, policy := range abacCfg.Policies {
+					_ = pe.AddPolicy([]byte(policy.Subject), policy.Action, policy.Resource, policy.Effect, nil)
+				}
+				log.Printf("[Container Bootstrap] Loaded conditional ABAC controls from %s", cfg.Files.AbacPath)
+			}
+		}
+	}
 
 	r, err := secure_network.NewRouter(
 		sdfEngine,
@@ -126,9 +217,8 @@ func Start(
 		log.Fatalf("Failed to initialize Router: %v", err)
 	}
 
-	// FIX 1: Direct Mux synchronization. Link GUIKit patterns to match standard network router tables.
 	if ui != nil {
-		r.Mux.Handle("/{$}", ui.Mux)
+		r.Mux.Handle("/index", ui.Mux)
 	}
 
 	bus := make(chan secure_network.SystemEvent, 128)
@@ -138,20 +228,12 @@ func Start(
 	gatewayPubKey, _ := db.Read(99, keyTxn, []byte("mesh_noise_pub"))
 	db.CommitTxn(keyTxn)
 
-	meshNode, err := secure_network.NewMeshNode(
-		sdfEngine,
-		gatewayPubKey,
-		sysLogger,
-	)
+	meshNode, err := secure_network.NewMeshNode(sdfEngine, gatewayPubKey, sysLogger)
 	if err != nil {
 		log.Fatalf("Failed creating mesh node: %v", err)
 	}
 
-	searchEngine, err := orchid_sync.NewEngine(
-		db,
-		meshNode,
-		sysLogger,
-	)
+	searchEngine, err := orchid_sync.NewEngine(db, meshNode, sysLogger)
 	if err != nil {
 		log.Fatalf("Failed to initialize OrchidSync: %v", err)
 	}
@@ -164,28 +246,20 @@ func Start(
 	go scim.Start()
 
 	for _, app := range cfg.Apps {
-		if err := admin.RegisterApp(app, "system_bootstrap"); err != nil {
-			sysLogger.Error("Failed registering app: " + err.Error())
-		}
+		_ = admin.RegisterApp(app, "system_bootstrap")
 	}
 
 	for _, user := range cfg.Users {
-		if err := admin.AssignUserToApp(user, user.SessionID, "system_bootstrap"); err != nil {
-			sysLogger.Error("Failed assigning user: " + err.Error())
-		}
+		_ = admin.AssignUserToApp(user, user.SessionID, "system_bootstrap")
 	}
 
-	secure_bootstrap.BootstrapAuth(r, db, concreteProvider, meshNode, "localhost:443", sysLogger)
+	hostAddr := cfg.Server.Host + ":443"
+	if cfg.Server.Host == "" {
+		hostAddr = "localhost:443"
+	}
+	secure_bootstrap.BootstrapAuth(r, db, concreteProvider, meshNode, hostAddr, sysLogger)
 
-	identity_provider.RegisterRoutes(
-		r,
-		admin,
-		audit,
-		pe,
-		concreteProvider.SessionManager,
-		sysLogger,
-		configPath,
-	)
+	identity_provider.RegisterRoutes(r, admin, audit, pe, concreteProvider.SessionManager, sysLogger, configPath)
 
 	s := &Server{
 		UI:           ui,
@@ -200,7 +274,6 @@ func Start(
 		ServiceKeys:  skm,
 	}
 
-	// FIX 2: Re-route default fallback pages through r.Router.Mux directly instead of breaking boundaries via ui.Mux
 	if ui != nil {
 		r.Mux.HandleFunc("GET /logout", func(w http.ResponseWriter, req *http.Request) {
 			secure_bootstrap.HandleLogout(w, req)
@@ -215,10 +288,9 @@ func Start(
 		})
 	}
 
-	// Custom configurations mount perfectly on the single network multiplexer tracking layout
-	routeRegister(&RouteModule{Server: s})
+	routeRegister(&RouteModule{Server: s, Views: cfg.Views})
 
-	log.Println("Booting Zero-Trust Identity Hub on :443")
+	log.Printf("Booting Zero-Trust Identity Hub on %s", hostAddr)
 	r.Port = "443"
 	go r.Boot() 
 
