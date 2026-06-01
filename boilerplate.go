@@ -24,7 +24,6 @@ import (
 
 type IdentityProvider interface{}
 
-// Declarative Schemas managed entirely inside the boilerplate core
 type ViewDefinition struct {
 	Name        string   `yaml:"name"`
 	Path        string   `yaml:"path"`
@@ -122,7 +121,6 @@ func Start(
 	routeRegister func(routes *RouteModule),
 ) *PlatformControl {
 
-	// 1. Ingest Master Configuration Layout
 	var cfg MasterConfig
 	cfgData, err := os.ReadFile(configPath)
 	if err != nil {
@@ -132,7 +130,6 @@ func Start(
 		log.Fatalf("Boilerplate Critical: Malformed configuration parameters: %v", err)
 	}
 
-	// Dynamic fallback view loader if pathing is decoupled from main file
 	if cfg.Files.ViewsPath != "" && len(cfg.Views) == 0 {
 		if vData, err := os.ReadFile(cfg.Files.ViewsPath); err == nil {
 			var secondaryViews struct {
@@ -165,9 +162,16 @@ func Start(
 		log.Fatalf("Failed to initialize SDF engine context: %v", err)
 	}
 
-	if concreteProvider.SessionManager == nil {
-		concreteProvider.SessionManager = secure_policy.NewSessionManager(sdfEngine, &jwtSigningKey.PublicKey)
+	// 1. Properly initialize the SessionManager using the container signing primitives
+	sessionManager := secure_policy.NewSessionManager(sdfEngine, &jwtSigningKey.PublicKey)
+
+	// 2. Invoke the native constructor to cleanly hydrate the WebAuthn Provider state
+	realProvider, err := webauthnext.New(ui, sessionManager, sdfEngine, serviceName, cfg.Server.Host, cfg.Server.Domain)
+	if err != nil {
+		log.Fatalf("Failed to execute native provider constructor: %v", err)
 	}
+	// Hydrate the shell pointer passed from the application block
+	*concreteProvider = *realProvider
 
 	sysLogger, err := logger.NewLogDispatcher(serviceName, 1000, sdfEngine)
 	if err != nil {
@@ -177,7 +181,6 @@ func Start(
 	skm := service_keys.NewServiceKeyManager(sdfEngine, concreteProvider, sysLogger)
 	pe := secure_policy.NewPolicyEngine(sdfEngine)
 
-	// 2. Automatically Hydrate RBAC Rules directly within Container Scope
 	if cfg.Files.RbacPath != "" {
 		if rbacData, err := os.ReadFile(cfg.Files.RbacPath); err == nil {
 			var rbacCfg RBACConfig
@@ -192,7 +195,6 @@ func Start(
 		}
 	}
 
-	// 3. Automatically Hydrate ABAC Policies directly within Container Scope
 	if cfg.Files.AbacPath != "" {
 		if abacData, err := os.ReadFile(cfg.Files.AbacPath); err == nil {
 			var abacCfg ABACConfig
@@ -205,12 +207,13 @@ func Start(
 		}
 	}
 
+	// 3. Pass the guaranteed, concrete sessionManager instance directly into the router
 	r, err := secure_network.NewRouter(
 		sdfEngine,
 		ui,
 		"session_id",
 		pe,
-		concreteProvider.SessionManager,
+		sessionManager, 
 		sysLogger,
 	)
 	if err != nil {
@@ -259,11 +262,11 @@ func Start(
 	}
 	secure_bootstrap.BootstrapAuth(r, db, concreteProvider, meshNode, hostAddr, sysLogger)
 
-	identity_provider.RegisterRoutes(r, admin, audit, pe, concreteProvider.SessionManager, sysLogger, configPath)
+	identity_provider.RegisterRoutes(r, admin, audit, pe, sessionManager, sysLogger, configPath)
 
 	s := &Server{
 		UI:           ui,
-		AuthProvider: provider,
+		AuthProvider: concreteProvider,
 		SearchEngine: searchEngine,
 		DB:           db,
 		Router:       r,
