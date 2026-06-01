@@ -163,13 +163,11 @@ func Start(
 
 	sessionManager := secure_policy.NewSessionManager(sdfEngine, &jwtSigningKey.PublicKey)
 
-	// FIX: Construct the provider using the formal constructor factory pattern
 	realProvider, err := webauthnext.New(ui, sessionManager, sdfEngine, serviceName, cfg.Server.Host, cfg.Server.Domain)
 	if err != nil {
 		log.Fatalf("Failed to execute native provider constructor: %v", err)
 	}
 
-	// Safely pass down the newly initialized provider values via pointer to the placeholder parameter
 	if inputPtr, ok := provider.(*webauthnext.Provider); ok && inputPtr != nil {
 		inputPtr.SessionManager = realProvider.SessionManager
 	}
@@ -179,7 +177,6 @@ func Start(
 		log.Fatalf("Failed to initialize logger: %v", err)
 	}
 
-	// FIX: Pass the guaranteed realProvider instance directly to avoid copying internal mutexes by value
 	skm := service_keys.NewServiceKeyManager(sdfEngine, realProvider, sysLogger)
 	pe := secure_policy.NewPolicyEngine(sdfEngine)
 
@@ -262,7 +259,6 @@ func Start(
 		hostAddr = "localhost:443"
 	}
 	
-	// FIX: Use realProvider here to eliminate thread execution lockups
 	secure_bootstrap.BootstrapAuth(r, db, realProvider, meshNode, hostAddr, sysLogger)
 
 	identity_provider.RegisterRoutes(r, admin, audit, pe, sessionManager, sysLogger, configPath)
@@ -289,7 +285,7 @@ func Start(
 			c := &guikit.Context{W: w, R: req, Data: make(map[string]interface{})}
 			secure_bootstrap.RequireAuth(r, func(ctx *guikit.Context) {
 				ctx.Data["Title"] = "Identity Dashboard"
-				ui.Render(ctx, "views/portal")
+				ui.Render(ctx, "views/auth")
 			})(c)
 		})
 	}
