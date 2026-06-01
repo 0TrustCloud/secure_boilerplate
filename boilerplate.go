@@ -259,6 +259,15 @@ func Start(
 		hostAddr = "localhost:443"
 	}
 	
+	// Agnostic Target Resolution: Find the view explicitly tagged as 'index'
+	targetURL := ""
+	for _, view := range cfg.Views {
+		if view.Name == "index" {
+			targetURL = view.Path
+			break
+		}
+	}
+
 	secure_bootstrap.BootstrapAuth(r, db, realProvider, meshNode, hostAddr, sysLogger)
 
 	identity_provider.RegisterRoutes(r, admin, audit, pe, sessionManager, sysLogger, configPath)
@@ -281,13 +290,20 @@ func Start(
 			secure_bootstrap.HandleLogout(w, req)
 		})
 
-		r.Mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, req *http.Request) {
-			c := &guikit.Context{W: w, R: req, Data: make(map[string]interface{})}
-			secure_bootstrap.RequireAuth(r, func(ctx *guikit.Context) {
-				ctx.Data["Title"] = "Identity Dashboard"
-				ui.Render(ctx, "views/auth")
-			})(c)
-		})
+		// The Agnostic Root Traffic Controller
+		// We only mount this redirect if an 'index' view is declared in views.yaml
+		// and it is NOT already the root path "/".
+		if targetURL != "" && targetURL != "/" {
+			r.Mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, req *http.Request) {
+				c := &guikit.Context{W: w, R: req, Data: make(map[string]interface{})}
+				
+				// RequireAuth will bounce unauthenticated users to /auth
+				// Authenticated users will pass through and be redirected to the YAML index
+				secure_bootstrap.RequireAuth(r, func(ctx *guikit.Context) {
+					http.Redirect(ctx.W, ctx.R, targetURL, http.StatusFound)
+				})(c)
+			})
+		}
 	}
 
 	routeRegister(&RouteModule{Server: s, Views: cfg.Views})
